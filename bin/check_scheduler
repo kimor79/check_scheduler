@@ -1,0 +1,824 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+##
+## Modules
+##
+
+require 'sysexits.ph';
+
+use Config::Simple;
+use Data::Dumper;
+use DB_File;
+use English;
+use Fcntl qw(:flock);
+use File::Basename;
+use FileHandle;
+use Getopt::Long;
+use IPC::System::Simple qw(capturex EXIT_ANY $EXITVAL);
+use JSON::DWIW;
+use LockFile::Simple;
+use Log::Log4perl qw(:easy);
+use LWP::UserAgent;
+use Parallel::ForkManager;
+use POSIX;
+use Proc::Daemon;
+use Socket;
+use Text::ParseWords;
+
+##
+## Variables
+##
+
+Getopt::Long::Configure ("bundling");
+
+my $PROGNAME = basename($0);
+my $REVISION = '1.0.0';
+
+my $CHECK_URL = '/api/w/v2/current_state.php?outputFormat=json';
+my $CLEAR_URL = '/api/w/v2/remove_state.php?outputFormat=json';
+my $COMMANDS_FILE = '/usr/local/etc/' . $PROGNAME . '/commands.conf';
+my $CONFIG_FILE = '/usr/local/etc/' . $PROGNAME . '/config.ini';
+my $D_GID;
+my $D_UID;
+my $CHECKS_DB;
+my $FORK_QUEUE;
+my $GENERATE_SLEEP = 600;
+my $LOG_FILE = '/var/log/ ' . $PROGNAME . '.log';
+my $LOGGER;
+my $MAX_CHECKS_PER_CHECKER = 10000;
+my $NODEGROUP;
+my $PID_LOCK;
+my %PIDS;
+my $SERVICES_URL = '/api/r/v2/list_all_services_by_node.php?outputFormat=json&nodegroup=';
+my $TIMES_DB;
+my $USERAGENT = $PROGNAME . '/' . $REVISION;
+
+##
+## Subroutines
+##
+
+sub usage {
+# Purpose: print a short help statement
+# Inputs: true to print to stderr, false to print to stdout
+# Outputs: help statement
+# Returns: exits
+
+	my $input = shift;
+	my $err;
+	my $fh;
+
+	if($input) {
+		$err = &EX_USAGE;
+		$fh = *STDERR;
+	} else {
+		$err = &EX_OK;
+		$fh = *STDOUT;
+	}
+
+	print $fh 'Usage: ' . $PROGNAME . ' [OPTIONS]' . "\n";
+	print $fh <<USAGE;
+
+Options:
+ -c <file>	Use alternate config file.
+ -d		Do not detach from terminal.
+ -h		This help statement.
+ -j <jobs>	Number of simultaneous checks.
+		Default is 20.
+ -n <nodegroup>	Get nodes from this nodegroup.
+ -q		Quiet. Errors only.
+ -s <seconds>	How long to wait between config updates.
+		Default is 600 seconds.
+ -u <user>	Run as user. Default is nagios.
+ -v		Increase verbosity. May be used twice.
+USAGE
+
+	exit($err);
+}
+
+sub init {
+# Purpose: Get command line options, set stuff up, etc
+# Inputs: none
+# Outputs: none
+# Returns: void
+
+	my $log_easy = { 'layout' => "%d: %P: %p - %m%n" };
+	my $log_options = {
+		'log4perl.appender.' . $PROGNAME => 'Log::Log4perl::Appender::File',
+		'log4perl.appender.' . $PROGNAME . '.layout' => 'PatternLayout',
+		'log4perl.appender.' . $PROGNAME . '.layout.ConversionPattern'  => "%d: %P: %p - %m%n",
+		'log4perl.appender.' . $PROGNAME . '.mode' => 'append',
+		'log4perl.appender.' . $PROGNAME . '.recreate' => 1,
+		'log4perl.appender.' . $PROGNAME . '.umask' => 022,
+	};
+
+	my $db_dir = '/var/db/' . $PROGNAME;
+	my $jobs = 20;
+	my $pid_file = '/var/run/' . $PROGNAME . '.pid';
+	my $user = 'nagios';
+
+	my $g_help;
+	my $g_jobs;
+	my $g_nodetach;
+	my $g_nodegroup;
+	my $g_sleep;
+	my $g_user;
+	my $g_verbose = 1;
+
+	my $result = GetOptions (
+		'c|config=s' => \$CONFIG_FILE,
+		'd' => \$g_nodetach,
+		'h|help|?' => \$g_help,
+		'j|jobs=i' => \$g_jobs,
+		'n|nodegroup=s' => \$g_nodegroup,
+		'q|quiet' => sub { $g_verbose = 0; },
+		's|sleep=s' => \$g_sleep,
+		'u|user=s' => \$g_user,
+		'v|verbose+' => \$g_verbose,
+	) || usage(1);
+
+	usage() if $g_help;
+
+	my $config = new Config::Simple($CONFIG_FILE);
+	if(!defined($config)) {
+		print STDERR Config::Simple->error();
+		exit(&EX_CONFIG);
+	}
+
+	my $c_commands_file = $config->('commands_file');
+	my $c_db_dir = $config->('db_dir');
+	my $c_jobs = $config->('jobs');
+	my $c_log_file = $config->('log_file');
+	my $c_max_checks_per_checker = $config->('max_checks_per_checker');
+	my $c_monitoring_url = $config->('monitoring_url');
+	my $c_nodegroup = $config->('nodegroup');
+	my $c_pid_file = $config->('pid_file');
+	my $c_sleep = $config->('sleep');
+	my $c_user = $config->('user');
+
+	if($g_user) {
+		$user = $g_user;
+	} elsif($c_user) {
+		$user = $c_user;
+	}
+
+	my @userinfo = getpwnam($user);
+	if(!@userinfo) {
+		print STDERR "No such user: $user\n";
+		exit(&EX_NOUSER);
+	}
+
+	$D_UID = $userinfo[2];
+	$D_GID = $userinfo[3];
+
+	$log_options->{'log4perl.appender.' . $PROGNAME . '.owner'} = $D_UID;
+
+	if($g_nodegroup) {
+		$NODEGROUP = $g_nodegroup;
+	} elsif($c_nodegroup) {
+		$NODEGROUP = $c_nodegroup;
+	} else {
+		print STDERR "Missing nodegroup\n";
+		exit(&EX_CONFIG);
+	}
+
+	if($c_monitoring_url) {
+		$CHECK_URL = $c_monitoring_url . $CHECK_URL;
+		$CLEAR_URL = $c_monitoring_url . $CLEAR_URL;
+		$SERVICES_URL = $c_monitoring_url . $SERVICES_URL;
+	} else {
+		print STDERR "Missing monitoring server section\n";
+	}
+
+	$log_options->{'log4perl.appender.' . $PROGNAME . '.filename'} = $LOG_FILE;
+
+	if(!$g_verbose) {
+		$log_easy->{'level'} = $WARN;
+		$log_options->{'log4perl.rootLogger'} = "WARN, $PROGNAME";
+	} elsif($g_verbose eq 1) {
+		$log_easy->{'level'} = $INFO;
+		$log_options->{'log4perl.rootLogger'} = "INFO, $PROGNAME";
+	} elsif($g_verbose eq 2) {
+		$log_easy->{'level'} = $DEBUG;
+		$log_options->{'log4perl.rootLogger'} = "DEBUG, $PROGNAME";
+	} else {
+		$log_easy->{'level'} = $TRACE;
+		$log_options->{'log4perl.rootLogger'} = "TRACE, $PROGNAME";
+	}
+
+	if(!$g_nodetach) {
+		Proc::Daemon::Init;
+		Log::Log4perl->init($log_options);
+
+		if($c_pid_file) {
+			$pid_file = $c_pid_file;
+		}
+
+		$PID_LOCK = LockFile::Simple->make(
+			-autoclean => 0,
+			-efunc => \&ERROR,
+			-format => $pid_file,
+			-hold => 0,
+			-max => 1,
+			-stale => 1,
+			-wfunc => \&WARN,
+		);
+
+		$PID_LOCK->trylock($PROGNAME) || do {
+			ERROR('Already running?');
+			exit(&EX_TEMPFAIL);
+		};
+	} else {
+		Log::Log4perl->easy_init($log_easy);
+	}
+
+	$LOGGER = get_logger();
+
+	$SIG{'TERM'} = \&zap_parent;
+	$SIG{'HUP'} = \&relog_parent;
+
+	$FORK_QUEUE = new Parallel::ForkManager($jobs);
+	$FORK_QUEUE->run_on_finish(\&child_finish);
+
+	if($c_db_dir) {
+		$db_dir = $c_db_dir;
+	}
+
+	$CHECKS_DB = $db_dir . '/checks.db';
+	$TIMES_DB = $db_dir . '/times.db';
+
+	if($c_sleep) {
+		$GENERATE_SLEEP = $c_sleep;
+	} elsif($g_sleep) {
+		$GENERATE_SLEEP = $g_sleep;
+	}
+
+	if($c_max_checks_per_checker) {
+		$MAX_CHECKS_PER_CHECKER = $c_max_checks_per_checker;
+	}
+
+	if($c_commands_file) {
+		$COMMANDS_FILE = $c_commands_file;
+	}
+
+	return;
+}
+
+sub relog_parent {
+# Send SIG to children
+
+	my $sig = shift;
+
+	Log::Log4perl->appender_by_name($PROGNAME)->file_switch($LOG_FILE);
+	DEBUG("Caught $sig, passing on to children");
+	kill($sig, keys(%PIDS));
+}
+
+sub zap_parent {
+# Kill children when parent gets SIGTERM
+
+	my $sig = shift;
+
+	INFO("Caught $sig, killing children");
+
+	kill('TERM', keys(%PIDS));
+	$FORK_QUEUE->wait_all_children();
+
+	INFO('All children killed, exiting');
+
+	$PID_LOCK->unlock($PROGNAME);
+	exit(&EX_OK);
+}
+
+sub zap_child {
+# exit if parent sent child SIGTERM
+
+	my $sig = shift;
+
+	INFO("Caught $sig (child), exiting");
+	exit(&EX_OK);
+}
+
+sub db_lock {
+# Purpose: Lock file
+# Inputs: file, lock type
+# Returns: filehandle
+
+	my ($file, $type) = @_;
+
+	TRACE("Attempting to lock $file");
+	my $fh = new FileHandle($file, O_CREAT|O_RDWR, 0644);
+	if(!defined($fh)) {
+		ERROR("Unable to get filehandle for $file: $!");
+		return undef;
+	}
+
+	flock($fh, $type) || do {
+		ERROR("Unable to lock $file: $!");
+		return undef;
+	};
+	TRACE("Locked $file");
+
+	return $fh;
+}
+
+sub db_unlock {
+# Purpose: Unlock file
+# Inputs: file handle
+
+	my $fh = shift;
+
+	TRACE('Attempting to unlock file');
+	if(!defined($fh)) {
+		ERROR("No filehandle given");
+		return 0;
+	}
+
+	flock($fh, LOCK_UN) || do {
+		ERROR("Unable to unlock file: $!");
+		return 0;
+	};
+	TRACE("unlocked file");
+
+	return 1;
+}
+
+sub child_finish {
+# Purpose: Run when a child terminates
+# This is a callback for Parallel::ForkManager->run_on_finish()
+
+	my ($pid, $exit_code, $ident, $signal) = @_;
+
+	if($exit_code) {
+		WARN("$pid exited $exit_code from signal $signal");
+	}
+
+	delete($PIDS{$pid});
+
+	return;
+}
+
+sub check_api {
+# Purpose: send check results to monitoring
+
+	my ($service_id, $node, $state, $message) = @_;
+
+	my $post = {
+		'service_id' => $service_id,
+		'node' => $node,
+		'state' => $state,
+		'message' => $message,
+	};
+
+	my $ua = LWP::UserAgent->new('agent' => $USERAGENT);
+	my $response = $ua->post($CHECK_URL, $post);
+
+	if($response->is_success()) {
+		my $output = JSON::DWIW->from_json($response->decoded_content());
+
+		if(defined($output->{'status'})) {
+			if($output->{'status'} eq '200') {
+				return;
+			}
+
+			WARN($node . ' ' . $service_id . ': ' . $output->{'status'} . ' - ' . $output->{'message'});
+		} else {
+			WARN($node . ' ' . $service_id . ': ' . $response->decoded_content());
+		}
+	} else {
+		WARN($node . ' ' . $service_id . ': ' . $response->status_line());
+	}
+}
+
+sub generate_checks {
+	DEBUG("generating checks");
+
+	my $ua = LWP::UserAgent->new('agent' => $USERAGENT);
+	my $response = $ua->get($SERVICES_URL . $NODEGROUP);
+
+	if(!$response->is_success()) {
+		ERROR("Unable to fetch: " . $response->status_line());
+		return;
+	}
+
+	my %dns;
+	my $json = $response->decoded_content();
+	my $records = JSON::DWIW->from_json($response->decoded_content());
+	my %new_checks;
+	my @new_states;
+	my @rm_states;
+	my $int_records = 0;
+	my $new_records = 0;
+	my $rm_records = 0;
+
+	if($records->{'status'} ne '200') {
+		ERROR('Bad status: ' . $records->{'status'} . ' ' . $records->{'message'});
+		return;
+	}
+
+	my $c_lock = db_lock($CHECKS_DB, LOCK_EX);
+	return unless(defined($c_lock));
+
+	my %config;
+	tie(%config, 'DB_File', $CHECKS_DB) || do {
+		ERROR("Unable to tie $CHECKS_DB: $!");
+		db_unlock($c_lock);
+		return;
+	};
+
+	foreach my $record (@{$records->{'records'}}) {
+		if(!$record->{'nodes.enabled'}) {
+			next;
+		}
+
+		if($record->{'check_commands.type'} ne 'nagios' && $record->{'check_commands.type'} ne 'nrpe') {
+			next;
+		}
+
+		my $enabled = $record->{'services.enabled'};
+		my $record_key;
+
+		# This is from a nodegroup
+		if(defined($record->{'service_nodegroups.service_id'})) {
+			$record_key = 'service_nodegroups';
+
+			if(defined($record->{'service_nodegroup_nodes.enabled'})) {
+				$enabled = $record->{'service_nodegroup_nodes.enabled'};
+			} elsif(defined($record->{'service_nodegroup.enabled'})) {
+				$enabled = $record->{'service_nodegroup.enabled'};
+			}
+		}
+
+		# This is from a node
+		if(defined($record->{'service_nodes.service_id'})) {
+			$record_key = 'service_nodes';
+
+			if(defined($record->{'service_nodes.enabled'})) {
+				$enabled = $record->{'service_nodes.enabled'};
+			}
+		}
+
+		next unless($enabled);
+
+		my $args = $record->{'services.args'};
+		my $critical_threshold = $record->{'services.critical_threshold'};
+		my $interval = $record->{'services.check_interval'};
+		my $ip;
+		my $warning_threshold = $record->{'services.warning_threshold'};
+
+		if(defined($record->{$record_key . '.args'})) {
+			$args = $record->{$record_key . '.args'};
+		}
+
+		if(defined($record->{$record_key . '.critical_threshold'})) {
+			$critical_threshold = $record->{$record_key . '.critical_threshold'};
+		}
+
+		if(defined($record->{$record_key . '.check_interval'})) {
+			$interval = $record->{$record_key . '.check_interval'};
+		}
+
+		if(defined($record->{$record_key . '.warning_threshold'})) {
+			$warning_threshold = $record->{$record_key . '.warning_threshold'};
+		}
+
+		if(defined($record->{'nodes.check_interval'})) {
+			$interval = $record->{'nodes.check_interval'};
+		}
+
+		$interval *= 60; # Convert to seconds
+
+		if(exists($dns{$record->{'nodes.node'}})) {
+			$ip = $dns{$record->{'nodes.node'}};
+		} else {
+			my $t_ip = scalar(gethostbyname($record->{'nodes.node'}));
+
+			if(!$t_ip) {
+				WARN($record->{'nodes.node'} . ' does not resolve, skipping');
+				next;
+			}
+
+			$ip = inet_ntoa($t_ip);
+			$dns{$record->{'nodes.node'}} = $ip;
+		}
+
+		my $key = $record->{'nodes.node'} . $ip . $record->{'services.service_id'} . $record->{'services.check_command'} .
+			$warning_threshold . $critical_threshold . $args . $interval;
+
+		$new_checks{$key} = 1;
+
+		if(!exists($config{$key})) {
+			$new_records++;
+			$config{$key} = JSON::DWIW->to_json({
+				'args' => $args,
+				'check_command' => $record->{'services.check_command'},
+				'check_interval' => $interval,
+				'critical_threshold' => $critical_threshold,
+				'node' => $record->{'nodes.node'},
+				'ip' => $ip,
+				'service_id' => $record->{'services.service_id'},
+				'warning_threshold' => $warning_threshold,
+			});
+
+			push(@new_states, { 'key' => $key, 'interval' => $interval });
+		}
+	}
+
+	# Make sure checks generation is a scheduled "check"
+	$new_checks{'__generate_checks'} = 1;
+
+	if(!exists($config{'__generate_checks'})) {
+		$int_records++;
+		$new_records++;
+		$config{'__generate_checks'} = JSON::DWIW->to_json({
+			'check_interval' => $GENERATE_SLEEP,
+			'node' => '__generate_checks',
+		});
+
+		push(@new_states, { 'key' => '__generate_checks', 'interval' => $GENERATE_SLEEP });
+	}
+
+	while(my ($key, $value) = each(%config)) {
+		if(!exists($new_checks{$key})) {
+			$rm_records++;
+			push(@rm_states, $value);
+			delete($config{$key});
+		}
+	}
+
+	INFO("Total checks: " . scalar(keys(%config)) . " new: $new_records removed: $rm_records internal: $int_records");
+
+	untie(%config);
+	db_unlock($c_lock);
+
+	my $t_lock = db_lock($TIMES_DB, LOCK_EX);
+	return unless(defined($t_lock));
+
+	my @times;
+	my $timedb = tie(@times, 'DB_File', $TIMES_DB, O_RDWR, 0644, $DB_RECNO) || do {
+		ERROR("Unable to tie $TIMES_DB: $!");
+		db_unlock($t_lock);
+		return;
+	};
+
+	foreach my $record (@new_states) {
+		my $key = sprintf("1 %s %s", $record->{'interval'}, $record->{'key'});
+		push(@times, $key);
+	}
+
+	undef($timedb);
+	untie(@times);
+	db_unlock($t_lock);
+
+	foreach my $record (@rm_states) {
+		my (undef, $data) = split(' ', $record, 2);
+		my $json = JSON::DWIW->from_json($data);
+
+		my $post = {
+			'service_id' => $json->{'service_id'},
+			'node' => $json->{'node'},
+		};
+
+		my $ua = LWP::UserAgent->new('agent' => $USERAGENT);
+		my $response = $ua->post($CLEAR_URL, $post);
+
+		if($response->is_success()) {
+			my $output = JSON::DWIW->from_json($response->decoded_content());
+
+			if(defined($output->{'status'})) {
+				if($output->{'status'} ne '200') {
+					WARN($json->{'node'} . ' ' . $json->{'service_id'} . ': ' . $output->{'status'} . ' - ' . $output->{'message'});
+				}
+			} else {
+				WARN($json->{'node'} . ' ' . $json->{'service_id'} . ': ' . $response->decoded_content());
+			}
+		} else {
+			WARN($json->{'node'} . ' ' . $json->{'service_id'} . ': ' . $response->status_line());
+		}
+	}
+
+	DEBUG("Generated checks");
+}
+
+sub do_check {
+# Purpose: Get the first node where now - interval > last_check
+# and run that check
+
+	my $commands;
+	my $commands_file_bad;
+	until(scalar(keys(%{$commands})) > 0) {
+		my $error;
+		($commands, $error) = JSON::DWIW->from_json_file($COMMANDS_FILE);
+
+		if($error) {
+			$commands_file_bad = 1;
+			ERROR($error);
+			sleep(300);
+			next;
+		}
+
+		if(scalar(keys(%{$commands})) < 1) {
+			$commands_file_bad = 1;
+			WARN('No commands. Sleeping for 300 seconds');
+			sleep(300);
+		}
+	}
+
+	if($commands_file_bad) {
+		undef($commands_file_bad);
+	}
+
+	for(my $i = 0; $i < $MAX_CHECKS_PER_CHECKER; $i++) {
+		my $t_lock = db_lock($TIMES_DB, LOCK_EX);
+		if(!defined($t_lock)) {
+			sleep(1); # Helps to cut down on cpu usage
+			next;
+		}
+
+		my @times;
+		my $timedb = tie(@times, 'DB_File', $TIMES_DB, O_RDWR, 0644, $DB_RECNO) || do {
+			ERROR("Unable to tie $TIMES_DB: $!");
+			db_unlock($t_lock);
+			sleep(1); # Helps to cut down on cpu usage
+			next;
+		};
+
+		my $found;
+		TRACE("Looking for next node");
+		foreach my $i (0 .. $timedb->length() -1) {
+			my ($time, $interval, $key) = split(' ', $times[$i], 3);
+			my $now = time();
+			if($time < $now) {
+				TRACE("Found $key");
+				$found = $key;
+				$timedb->del($i);
+				my $new_value = $now + $interval;
+				$new_value .= ' ' . $interval . ' ' . $key;
+				push(@times, $new_value);
+				last;
+			}
+		}
+
+		if(!$found) {
+			TRACE('Nothing to check');
+			undef($timedb);
+			untie(@times);
+			db_unlock($t_lock);
+			sleep(1); # Helps to cut down on cpu usage
+			next;
+		}
+
+		my $c_lock = db_lock($CHECKS_DB, LOCK_SH);
+		unless(defined($c_lock)) {
+			undef($timedb);
+			untie(@times);
+			db_unlock($t_lock);
+		}
+
+		my %config;
+		tie(%config, 'DB_File', $CHECKS_DB) || do {
+			ERROR("Unable to tie $CHECKS_DB: $!");
+			db_unlock($c_lock);
+			sleep(1); # Helps to cut down on cpu usage
+			next;
+		};
+
+		if(!exists($config{$found})) {
+			pop(@times);
+		};
+
+		undef($timedb);
+		untie(@times);
+		db_unlock($t_lock);
+
+		my $check = JSON::DWIW->from_json($config{$found});
+
+		untie(%config);
+		db_unlock($c_lock);
+
+		if(!exists($check->{'node'})) {
+			TRACE("Nothing to check");
+			sleep(1); # Helps to cut down on cpu usage
+			next;
+		}
+
+		if($check->{'node'} eq '__generate_checks') {
+			generate_checks();
+			next;
+		}
+
+		TRACE("Checking " . $check->{'node'} . " " . $check->{'check_interval'} . " " . $check->{'service_id'});
+
+		if(!defined($commands->{$check->{'check_command'}})) {
+			WARN('Unknown command for ' . $check->{'node'});
+			sleep(1); # Helps to cut down on cpu usage
+			next;
+		}
+
+		my $command = $commands->{$check->{'check_command'}};
+
+		my @cli;
+
+		if(defined($command->{'hostname'})) {
+			push(@cli, ($command->{'hostname'}, $check->{'node'}));
+		}
+
+		if(defined($command->{'ip'})) {
+			push(@cli, ($command->{'ip'}, $check->{'ip'}));
+		}
+
+		if(defined($command->{'args'})) {
+			push(@cli, shellwords($command->{'args'}));
+		}
+
+		my @options;
+		if(defined($command->{'warning'}) && defined($check->{'warning_threshold'})) {
+			push(@options, ($command->{'warning'}, $check->{'warning_threshold'}));
+		}
+
+		if(defined($command->{'critical'}) && defined($check->{'critical_threshold'})) {
+			push(@options, ($command->{'critical'}, $check->{'critical_threshold'}));
+		}
+
+		if(defined($check->{'args'})) {
+			push(@options, shellwords($check->{'args'}));
+		}
+
+		if(defined($command->{'nrpe'})) {
+			push(@cli, ('-c', $command->{'nrpe'}));
+
+			if(scalar(@options) > 0) {
+				push(@cli, ('-a', join(' ', @options)));
+			}
+		} else {
+			if(scalar(@options) > 0) {
+				push(@cli, @options);
+			}
+		}
+
+		if($LOGGER->is_debug() && scalar(@cli) > 0) {
+			DEBUG($command->{'command'} . ' ' . join(' ', @cli));
+		}
+
+		my $message;
+		eval {
+			local $SIG{'ALRM'} = sub { die('Command took longer than 90 seconds to run'); };
+			alarm 90;
+			$message = capturex(EXIT_ANY, $command->{'command'}, @cli);
+			alarm 0;
+		};
+
+		if($@) {
+			$message = $@;
+		}
+
+		my $state = 3;
+		if($EXITVAL eq 0 || $EXITVAL eq 1 || $EXITVAL eq 2) {
+			$state = $EXITVAL;
+		}
+
+		check_api($check->{'service_id'}, $check->{'node'}, $state, $message);
+	}
+
+	INFO("Reached $MAX_CHECKS_PER_CHECKER checks");
+}
+
+##
+## Main
+##
+
+init();
+INFO("Starting");
+generate_checks();
+
+chown($D_UID, -1, $CHECKS_DB);
+chown($D_UID, -1, $TIMES_DB);
+
+while(1) {
+	my $parent = $FORK_QUEUE->start();
+
+	if($parent) {
+		$PIDS{$parent} = $parent;
+		next;
+	}
+
+	setuid($D_UID);
+	setgid($D_GID);
+
+	$SIG{'TERM'} = \&zap_child;
+	$SIG{'HUP'} = \&zap_child;
+
+	INFO("Process spawned");
+
+	do_check();
+
+	$FORK_QUEUE->finish();
+}
+
+#
+# If we get here then something went wrong
+FATAL("Exiting");
+$PID_LOCK->unlock($PROGNAME);
+exit(&EX_SOFTWARE);

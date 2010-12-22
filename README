@@ -1,0 +1,10 @@
+This is a perl-based forking remote monitoring scheduler.
+
+It is based on nagios concepts but is more piecemeal. This component is
+just the process that runs the actual checks (nagios style scripts) without
+the overhead of running the entire monitoring system. Because of this, some
+functionality might be missing, like the ability to reschedule a check for
+"now".
+
+check_scheduler can do about 8 checks/second with a total of ~7000 checks on
+a single server.
